@@ -31,7 +31,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-import { validateMigrationFreeze } from './lib/migration-freeze.mjs';
+import { normalizedSha256, validateMigrationFreeze } from './lib/migration-freeze.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -269,7 +269,41 @@ let freezeResult;
 try {
   freezeResult = validateMigrationFreeze(REPO_ROOT);
 } catch (err) {
-  fail(`migration 冻结校验无法执行：${err instanceof Error ? err.message : String(err)}`);
+  const message = err instanceof Error ? err.message : String(err);
+  if (!/not a git repository/i.test(message)) {
+    fail(`migration 冻结校验无法执行：${message}`);
+  }
+  // FORK(cindy-local): 源码以 tarball 交付时没有 .git,靠 Git 历史做的增量冻结
+  // 在这里无从执行。固定 SHA256 基线仍然逐条比对内容,只跳过 Git 侧那部分;
+  // 只要仓库里有 .git,上面的正常路径就不会走到这里,改写历史 migration 依旧失败。
+  const baseline = JSON.parse(
+    fs.readFileSync(path.join(DRIZZLE_DIR, 'migration-baseline.json'), 'utf-8'),
+  );
+  const violations = [];
+  const checkFiles = (dir, entries) => {
+    for (const [fileName, expected] of Object.entries(entries ?? {})) {
+      const filePath = path.join(DRIZZLE_DIR, dir, fileName);
+      if (!fs.existsSync(filePath)) {
+        violations.push({ path: filePath, kind: 'deleted' });
+        continue;
+      }
+      if (normalizedSha256(fs.readFileSync(filePath, 'utf-8')) !== expected) {
+        violations.push({ path: filePath, kind: 'modified' });
+      }
+    }
+  };
+  checkFiles('', baseline.migrations);
+  checkFiles('scripts', baseline.runtimeScripts);
+  freezeResult = {
+    fixedCheck: {
+      sourceCommit: baseline.sourceCommit,
+      migrationCount: Object.keys(baseline.migrations ?? {}).length,
+      runtimeScriptCount: Object.keys(baseline.runtimeScripts ?? {}).length,
+      violations,
+    },
+    baseline: null,
+    mainCheck: null,
+  };
 }
 
 const freezeChecks = [

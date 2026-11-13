@@ -1,0 +1,16 @@
+{
+  "kind": "custom",
+  "name": "Ollama（本机）",
+  "auth": { "method": "none" },
+  "endpoints": [
+    {
+      "protocol": "openai-chat",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "targets": ["pi"],
+      "models": [
+        { "id": "qwen3:8b", "name": "Qwen3 8B (Ollama)" },
+        { "id": "deepseek-r1:8b", "name": "DeepSeek R1 8B (Ollama)" }
+      ]
+    }
+  ]
+}

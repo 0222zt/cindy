@@ -1,0 +1,15 @@
+{
+  "kind": "custom",
+  "name": "Cindy Local Mock（离线验收）",
+  "auth": { "method": "none" },
+  "endpoints": [
+    {
+      "protocol": "openai-chat",
+      "baseUrl": "http://127.0.0.1:11435/v1",
+      "targets": ["pi"],
+      "models": [
+        { "id": "cindy-local-mock", "name": "Cindy Local Mock" }
+      ]
+    }
+  ]
+}

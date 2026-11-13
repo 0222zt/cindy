@@ -96,6 +96,9 @@ export function defaultMarketPluginSyncOutcome(
 export async function syncDefaultMarketPlugins(
   trigger: PluginMarketSnapshotOptions['trigger'] = 'background',
 ): Promise<DefaultMarketPluginSyncOutcome> {
+  // FORK(cindy-local): 本地离线模式没有云端插件市场;跳过后台目录同步,
+  // 避免完全断网时每轮重试 /api/plugins 产生日志噪音。
+  if (process.env.XDT_DESKTOP_DEV_MODE === 'local') return 'completed';
   try {
     let reconciliationOutcome: 'completed' | 'failed' | null = null;
     const snapshot = await snapshotAndSignalRemovalNotice({
@@ -125,6 +128,8 @@ export async function syncDefaultMarketPlugins(
 
 /** Signal foreground removals without requesting another snapshot or disk scan. */
 export async function refreshForegroundMarketPlugins(): Promise<'completed' | 'failed'> {
+  // FORK(cindy-local): 同 syncDefaultMarketPlugins,本地模式下不做云端前台刷新。
+  if (process.env.XDT_DESKTOP_DEV_MODE === 'local') return 'completed';
   try {
     return await service().refreshCatalogForForeground();
   } finally {

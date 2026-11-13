@@ -69,7 +69,10 @@ function formatLocalBuildTime(date = new Date()): string {
  * package.json still contains the 0.0.0 placeholder.
  */
 function stageCindySourceMetadata(): void {
-  const sourceCommit = resolveSourceCommit();
+  // FORK(cindy-local): tarball 交付没有 .git,上游这里会写空 sourceCommit,
+  // 随后 verifyPackagedSourceMetadata 以「空值」拒绝产物。写一个明确的占位值,
+  // 让诊断信息仍然说明包来自本地源码树;有 Git 时照旧写真实 commit。
+  const sourceCommit = resolveSourceCommit() || 'local-source-tarball';
   const builtAt = formatLocalBuildTime();
   fs.writeFileSync(
     CINDY_SOURCE_METADATA_PATH,
@@ -391,6 +394,72 @@ function bundleNativeDeps(buildPath: string, targetPlatform: string, targetArch:
   copyRuntimeDependencyTrees(READ_SHEET_RUNTIME_PACKAGES, destModules);
 }
 
+// FORK(cindy-local): 版本无关包优先复用 ensure-deps 准备好的 Electron ABI
+// better_sqlite3.node。上游打包时会强制 electron-rebuild,本机没有 MSVC /
+// Windows SDK 时 node-gyp 会因找不到 Visual Studio 直接失败。缓存带标记文件,
+// 版本 / 平台 / 架构必须全部对得上才使用;正式版本号打包仍走上游重编路径。
+function tryUseCachedElectronSqlite(
+  buildPath: string,
+  electronVersion: string,
+  platform: string,
+  arch: string,
+): boolean {
+  if (process.env.APP_VERSION !== '0.0.0') return false;
+
+  const moduleDir = path.join(buildPath, 'node_modules', 'better-sqlite3');
+  let moduleVersion: string;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(moduleDir, 'package.json'), 'utf8')) as {
+      version: string;
+    };
+    moduleVersion = pkg.version;
+  } catch {
+    return false;
+  }
+
+  const cacheDir = path.join(
+    path.resolve(__dirname, '../..'),
+    'node_modules',
+    '.xdt-electron-native',
+    `electron-${electronVersion}-${platform}-${arch}-better-sqlite3-${moduleVersion}`,
+  );
+  const binding = path.join(
+    cacheDir,
+    'node_modules',
+    'better-sqlite3',
+    'build',
+    'Release',
+    'better_sqlite3.node',
+  );
+  if (!fs.existsSync(binding)) return false;
+
+  let marker: Record<string, string>;
+  try {
+    marker = JSON.parse(
+      fs.readFileSync(path.join(cacheDir, '.xdt-native-marker.json'), 'utf8'),
+    ) as Record<string, string>;
+  } catch {
+    return false;
+  }
+  if (
+    marker.module !== 'better-sqlite3' ||
+    marker.moduleVersion !== moduleVersion ||
+    marker.electronVersion !== electronVersion ||
+    marker.platform !== platform ||
+    marker.arch !== arch
+  ) {
+    return false;
+  }
+
+  const target = path.join(moduleDir, 'build', 'Release', 'better_sqlite3.node');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.copyFileSync(binding, target);
+  console.log(
+    `[forge:afterCopy] versionless build — reuse cached Electron ${electronVersion} better-sqlite3 binding (${moduleVersion})`,
+  );
+  return true;
+}
+
 // better-sqlite3 仍按 Electron ABI 重编。node-pty 在 macOS/Windows 使用 npm 包内
 // 的 N-API 预编译件；缺件意味着依赖不完整，不能悄悄转入源码编译。Linux 继续重编。
 async function rebuildNativeDepsInPackage(
@@ -400,18 +469,27 @@ async function rebuildNativeDepsInPackage(
   arch: string,
 ): Promise<void> {
   const nodePty = preparePackagedNodePty(buildPath, platform, arch);
-  const modules = ['better-sqlite3'];
+  const modules: string[] = [];
+  // FORK(cindy-local): 有可用的 Electron ABI 预编译件时不再触发 node-gyp;
+  // 缓存缺失或标记不匹配就回到上游的重编路径,不静默降级。
+  if (!tryUseCachedElectronSqlite(buildPath, electronVersion, platform, arch)) {
+    modules.push('better-sqlite3');
+  }
   if (nodePty.rebuild) modules.push('node-pty');
-  console.log(
-    `[forge:afterCopy] rebuilding native modules (${modules.join(', ')}) for Electron ${electronVersion} (${arch})...`,
-  );
-  await electronRebuild({
-    buildPath,
-    electronVersion,
-    arch,
-    force: true,
-    onlyModules: modules,
-  });
+  if (modules.length === 0) {
+    console.log('[forge:afterCopy] native modules resolved from prebuilt cache; skip electronRebuild');
+  } else {
+    console.log(
+      `[forge:afterCopy] rebuilding native modules (${modules.join(', ')}) for Electron ${electronVersion} (${arch})...`,
+    );
+    await electronRebuild({
+      buildPath,
+      electronVersion,
+      arch,
+      force: true,
+      onlyModules: modules,
+    });
+  }
   const sqliteNative = path.join(
     buildPath,
     'node_modules',
@@ -467,8 +545,33 @@ const isWin = process.platform === 'win32';
  * Hard-fails if cargo is missing or the build errors — we'd rather break
  * the release than ship a stale updater.
  */
+/**
+ * FORK(cindy-local): 版本无关包(占位 0.0.0)在本机打包时,如果没有 Rust 工具链,
+ * 跳过依赖 cargo/rustc 的 Windows 辅助程序;正式版本号或工具链就绪时行为不变。
+ * 返回 true 表示调用方应直接 return。
+ */
+function skipOptionalRustHelperForVersionless(artifactPath: string, label: string): boolean {
+  if (process.env.APP_VERSION !== '0.0.0' || fs.existsSync(artifactPath)) return false;
+  const userCargo = process.env.USERPROFILE
+    ? path.join(process.env.USERPROFILE, '.cargo', 'bin', 'cargo.exe')
+    : '';
+  if (userCargo && fs.existsSync(userCargo)) return false;
+  const probe = spawnSync('cargo', ['--version'], { stdio: 'ignore', windowsHide: true });
+  if (probe.status === 0) return false;
+  console.log(
+    `[forge:prePackage] versionless build — skip ${label} (no Rust toolchain; feature degrades gracefully)`,
+  );
+  return true;
+}
+
 function buildCindyUpdater(): void {
   if (process.platform !== 'win32') return;
+  // FORK(cindy-local): 版本无关包(占位 0.0.0)运行时整条更新链都被豁免,
+  // cindy-updater.exe 永远不会被拉起。本地打包机没有 Rust/MSVC 时不再为了
+  // 一个不执行的二进制去装整套工具链;有预编译产物或正式版本号时行为不变。
+  if (skipOptionalRustHelperForVersionless(path.join(__dirname, 'resources', UPDATER_EXE), UPDATER_EXE)) {
+    return;
+  }
   console.log(`[forge:prePackage] Building ${UPDATER_EXE} (Rust + Tauri)...`);
 
   const updaterRoot = path.join(__dirname, 'cindy-updater', 'src-tauri');
@@ -846,8 +949,15 @@ function extraResourcesForTarget(targetPlatform: string): string[] {
 
   const windowsUpdaterRuntimeResource = windowsUpdaterRuntimeExtraResourceForTarget(targetPlatform);
   if (windowsUpdaterRuntimeResource) {
+    // FORK(cindy-local): 版本无关包在没有 Rust 工具链时会跳过 cindy-updater.exe 的
+    // 编译(补丁 5)。上游这里无条件把它列进 extraResource,electron-packager 会因为
+    // lstat 不到文件而整包失败。正式版本号仍然要求更新器存在,行为不变。
+    const updaterPath = path.join(__dirname, 'resources', UPDATER_EXE);
+    const skipUpdater =
+      process.env.APP_VERSION === '0.0.0' && !fs.existsSync(updaterPath);
+    const updaterResources = skipUpdater ? [] : [`resources/${UPDATER_EXE}`];
     base.unshift(
-      `resources/${UPDATER_EXE}`,
+      ...updaterResources,
       'resources/windows-installation-version.ps1',
       windowsUpdaterRuntimeResource,
     );
@@ -1240,6 +1350,14 @@ function buildRemoteDesktopInput(platform: ForgePlatform, arch: ForgeArch): void
     if (result.error || result.status !== 0) throw new Error('Remote desktop capture build failed');
     fs.chmodSync(capture, 0o755);
   } else if (process.platform === 'win32' && platform === 'win32') {
+    if (
+      skipOptionalRustHelperForVersionless(
+        path.join(destDir, 'cindy-windows-desktop-host.node'),
+        'remote desktop helpers',
+      )
+    ) {
+      return;
+    }
     if (arch !== 'x64' && arch !== 'arm64')
       throw new Error('Unsupported Windows desktop architecture');
     const target = arch === 'arm64' ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-msvc';
@@ -1301,6 +1419,15 @@ function buildWindowsGamepadHelper(platform: ForgePlatform, arch: ForgeArch): vo
 
 function buildWindowsTaskbarAddon(platform: ForgePlatform, arch: ForgeArch): void {
   if (process.platform !== 'win32' || platform !== 'win32') return;
+  const dest = path.join(__dirname, 'resources', 'tools', 'windows-taskbar');
+  if (
+    skipOptionalRustHelperForVersionless(
+      path.join(dest, 'cindy-windows-taskbar.node'),
+      'windows taskbar addon',
+    )
+  ) {
+    return;
+  }
   const target =
     arch === 'arm64' ? 'aarch64-pc-windows-msvc' : arch === 'x64' ? 'x86_64-pc-windows-msvc' : null;
   if (!target) throw new Error(`[forge] Unsupported Windows taskbar architecture: ${arch}`);
@@ -1327,11 +1454,11 @@ function buildWindowsTaskbarAddon(platform: ForgePlatform, arch: ForgeArch): voi
       throw new Error(
         `[forge] Windows taskbar build failed: ${result.error?.message ?? result.status}`,
       );
-    const dest = path.join(__dirname, 'resources', 'tools', 'windows-taskbar');
-    fs.mkdirSync(dest, { recursive: true });
+    const dest2 = path.join(__dirname, 'resources', 'tools', 'windows-taskbar');
+    fs.mkdirSync(dest2, { recursive: true });
     fs.copyFileSync(
       path.join(build, target, 'release', 'cindy_windows_taskbar.dll'),
-      path.join(dest, 'cindy-windows-taskbar.node'),
+      path.join(dest2, 'cindy-windows-taskbar.node'),
     );
   } finally {
     fs.rmSync(build, { recursive: true, force: true });
@@ -1340,6 +1467,14 @@ function buildWindowsTaskbarAddon(platform: ForgePlatform, arch: ForgeArch): voi
 
 function buildWindowsAtomicRenameHelper(platform: ForgePlatform, arch: ForgeArch): void {
   if (process.platform !== 'win32' || platform !== 'win32') return;
+  if (
+    skipOptionalRustHelperForVersionless(
+      path.join(__dirname, 'resources', 'tools', 'windows-atomic-rename', 'cindy-windows-atomic-rename.exe'),
+      'windows atomic rename helper',
+    )
+  ) {
+    return;
+  }
   const target =
     arch === 'arm64' ? 'aarch64-pc-windows-msvc' : arch === 'x64' ? 'x86_64-pc-windows-msvc' : null;
   if (!target) throw new Error(`[forge] Unsupported Windows atomic rename architecture: ${arch}`);
@@ -1383,10 +1518,18 @@ function buildWindowsInputHelper(
   arch: ForgeArch,
 ): void {
   if (process.platform !== 'win32' || platform !== 'win32') return;
+  const group = kind === 'gamepad' ? 'xbox-gamepad' : 'worklouder';
+  if (
+    skipOptionalRustHelperForVersionless(
+      path.join(__dirname, 'resources', 'tools', group, `cindy-windows-${kind}-helper.exe`),
+      `windows ${kind} input helper`,
+    )
+  ) {
+    return;
+  }
   const target =
     arch === 'arm64' ? 'aarch64-pc-windows-msvc' : arch === 'x64' ? 'x86_64-pc-windows-msvc' : null;
   if (!target) throw new Error(`[forge] Unsupported Windows gamepad helper architecture: ${arch}`);
-  const group = kind === 'gamepad' ? 'xbox-gamepad' : 'worklouder';
   const source = path.join(__dirname, 'native', group, `windows-${kind}-helper`);
   const userCargo = process.env.USERPROFILE
     ? path.join(process.env.USERPROFILE, '.cargo', 'bin', 'cargo.exe')
@@ -1436,6 +1579,14 @@ function buildRegionScreenshotHelper(platform: ForgePlatform, arch: ForgeArch): 
     return;
   }
   if (process.platform !== 'win32' || platform !== 'win32') return;
+  if (
+    skipOptionalRustHelperForVersionless(
+      path.join(dest, 'cindy-windows-screenshot-snapshot.exe'),
+      'region screenshot helper',
+    )
+  ) {
+    return;
+  }
   const target =
     arch === 'arm64' ? 'aarch64-pc-windows-msvc' : arch === 'x64' ? 'x86_64-pc-windows-msvc' : null;
   if (!target) throw new Error(`[forge] Unsupported region screenshot helper architecture: ${arch}`);
@@ -1580,6 +1731,14 @@ function buildMacVoiceInputModifierShortcutListener(
 
 function buildWindowsVoiceInputFunctionKeyListener(targetPlatform: string): void {
   if (process.platform !== 'win32' || targetPlatform !== 'win32') return;
+  if (
+    skipOptionalRustHelperForVersionless(
+      path.join(__dirname, 'resources', 'tools', 'voice-input', 'cindy-windows-function-key-listener.exe'),
+      'windows function key listener',
+    )
+  ) {
+    return;
+  }
   const sourceRoot = path.join(__dirname, 'native', 'voice-input', 'windows-function-key-listener');
   const manifest = path.join(sourceRoot, 'Cargo.toml');
   if (!fs.existsSync(manifest)) {
